@@ -1,0 +1,243 @@
+/*
+ * sped.c — Simplest PNG ESP32 Decoder
+ *
+ * Streaming PNG decoder: parses chunks, inflates IDAT data via tinfl,
+ * reconstructs scanline filters, converts to RGB565 row-by-row.
+ *
+ * Requires: miniz.h (tinfl) — available in ESP-IDF via esp_rom,
+ * or from https://github.com/richgel999/miniz
+ */
+
+#include "sped.h"
+#include <string.h>
+#include <stdlib.h>
+
+#ifndef SPED_INFLATE_INCLUDE
+#define SPED_INFLATE_INCLUDE "miniz.h"
+#endif
+#include SPED_INFLATE_INCLUDE
+
+/* PNG file signature */
+static const uint8_t png_sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+
+/* Read 4-byte big-endian integer */
+static uint32_t r32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Paeth predictor (PNG filter type 4) */
+static uint8_t paeth(uint8_t a, uint8_t b, uint8_t c)
+{
+    int p = (int)a + (int)b - (int)c;
+    int pa = p - (int)a; if (pa < 0) pa = -pa;
+    int pb = p - (int)b; if (pb < 0) pb = -pb;
+    int pc = p - (int)c; if (pc < 0) pc = -pc;
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
+
+/* Max IDAT chunks we track */
+#define SPED_MAX_IDAT 64
+
+int sped_info(const void *png, size_t len, sped_info_t *info)
+{
+    const uint8_t *p = png;
+    if (len < 33 || memcmp(p, png_sig, 8) != 0) return -1;
+    p += 8;
+    if (r32(p) != 13 || memcmp(p + 4, "IHDR", 4) != 0) return -1;
+    info->width = r32(p + 8);
+    info->height = r32(p + 12);
+    return 0;
+}
+
+int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user)
+{
+    const uint8_t *base = png;
+    const uint8_t *end = base + len;
+
+    /* Signature */
+    if (len < 33 || memcmp(base, png_sig, 8) != 0) return -1;
+
+    /* IHDR must be the first chunk */
+    const uint8_t *p = base + 8;
+    if (r32(p) != 13 || memcmp(p + 4, "IHDR", 4) != 0) return -1;
+
+    const uint8_t *ihdr = p + 8;
+    uint32_t w = r32(ihdr);
+    uint32_t h = r32(ihdr + 4);
+    uint8_t depth = ihdr[8];
+    uint8_t ctype = ihdr[9];
+
+    /* Reject unsupported features */
+    if (ihdr[10] != 0) return -1;  /* compression must be 0 */
+    if (ihdr[11] != 0) return -1;  /* filter must be 0 */
+    if (ihdr[12] != 0) return -1;  /* interlace not supported */
+    if (depth != 8) return -1;     /* only 8-bit depth */
+    if (w == 0 || h == 0) return -1;
+
+    /* Bytes per pixel */
+    int bpp;
+    switch (ctype) {
+        case 0: bpp = 1; break;  /* grayscale */
+        case 2: bpp = 3; break;  /* RGB */
+        case 3: bpp = 1; break;  /* indexed (palette) */
+        case 4: bpp = 2; break;  /* grayscale + alpha */
+        case 6: bpp = 4; break;  /* RGBA */
+        default: return -1;
+    }
+    int stride = (int)(w * bpp);
+
+    /* Scan chunks: collect PLTE, tRNS, IDAT pointers */
+    uint8_t pal[256][3];
+    uint8_t pal_a[256];
+    memset(pal_a, 255, sizeof(pal_a));
+
+    struct { const uint8_t *data; uint32_t len; } idat[SPED_MAX_IDAT];
+    int nidat = 0;
+
+    const uint8_t *cp = base + 8 + 25; /* after signature + IHDR (25 = 4+4+13+4) */
+    while (cp + 12 <= end) {
+        uint32_t clen = r32(cp);
+        if (cp + 12 + clen > end) break;
+
+        if (memcmp(cp + 4, "PLTE", 4) == 0) {
+            int n = (int)(clen / 3);
+            if (n > 256) n = 256;
+            for (int i = 0; i < n; i++) {
+                pal[i][0] = cp[8 + i * 3];
+                pal[i][1] = cp[8 + i * 3 + 1];
+                pal[i][2] = cp[8 + i * 3 + 2];
+            }
+        } else if (memcmp(cp + 4, "tRNS", 4) == 0) {
+            if (ctype == 3) {
+                for (uint32_t i = 0; i < clen && i < 256; i++)
+                    pal_a[i] = cp[8 + i];
+            }
+        } else if (memcmp(cp + 4, "IDAT", 4) == 0) {
+            if (nidat < SPED_MAX_IDAT) {
+                idat[nidat].data = cp + 8;
+                idat[nidat].len = clen;
+                nidat++;
+            }
+        } else if (memcmp(cp + 4, "IEND", 4) == 0) {
+            break;
+        }
+        cp += 12 + clen;
+    }
+    if (nidat == 0) return -1;
+
+    /* Allocate work buffers */
+    uint8_t *cur = calloc(1, stride);
+    uint8_t *prev = calloc(1, stride);
+    uint16_t *out = malloc(w * sizeof(uint16_t));
+    uint8_t *dict = malloc(TINFL_LZ_DICT_SIZE);
+    if (!cur || !prev || !out || !dict) {
+        free(cur); free(prev); free(out); free(dict);
+        return -1;
+    }
+
+    /* Init inflate */
+    tinfl_decompressor decomp;
+    tinfl_init(&decomp);
+    size_t dict_ofs = 0;
+
+    /* IDAT feed state */
+    int ci = 0;                       /* current IDAT index */
+    const uint8_t *in_ptr = idat[0].data;
+    size_t in_remain = idat[0].len;
+
+    /* Scanline assembly state */
+    int sl_pos = 0;        /* 0 = expecting filter byte, 1..stride = pixel data */
+    uint8_t filter = 0;
+    int row = 0;
+
+    while (row < (int)h) {
+        /* Determine flags for tinfl */
+        int more = (ci < nidat - 1) || (in_remain > 0);
+        uint32_t flags = TINFL_FLAG_PARSE_ZLIB_HEADER;
+        if (more) flags |= TINFL_FLAG_HAS_MORE_INPUT;
+
+        size_t in_bytes = in_remain;
+        size_t out_bytes = TINFL_LZ_DICT_SIZE - dict_ofs;
+
+        tinfl_status st = tinfl_decompress(&decomp, in_ptr, &in_bytes,
+                                           dict, dict + dict_ofs, &out_bytes,
+                                           flags);
+        in_ptr += in_bytes;
+        in_remain -= in_bytes;
+
+        /* Process decompressed output */
+        const uint8_t *dp = dict + dict_ofs;
+        size_t avail = out_bytes;
+        dict_ofs = (dict_ofs + out_bytes) & (TINFL_LZ_DICT_SIZE - 1);
+
+        while (avail > 0 && row < (int)h) {
+            if (sl_pos == 0) {
+                filter = *dp++;
+                avail--;
+                sl_pos = 1;
+            } else {
+                size_t need = (size_t)(stride - (sl_pos - 1));
+                size_t take = (avail < need) ? avail : need;
+                memcpy(cur + (sl_pos - 1), dp, take);
+                dp += take;
+                avail -= take;
+                sl_pos += (int)take;
+
+                if (sl_pos > stride) {
+                    /* Scanline complete — apply inverse filter */
+                    for (int i = 0; i < stride; i++) {
+                        uint8_t a = (i >= bpp) ? cur[i - bpp] : 0;
+                        uint8_t b = prev[i];
+                        uint8_t c = (i >= bpp) ? prev[i - bpp] : 0;
+                        switch (filter) {
+                            case 1: cur[i] += a; break;
+                            case 2: cur[i] += b; break;
+                            case 3: cur[i] += (uint8_t)((a + b) >> 1); break;
+                            case 4: cur[i] += paeth(a, b, c); break;
+                        }
+                    }
+
+                    /* Convert to RGB565 */
+                    for (uint32_t x = 0; x < w; x++) {
+                        uint8_t r, g, bl;
+                        switch (ctype) {
+                            case 0: r = g = bl = cur[x]; break;
+                            case 2: r = cur[x*3]; g = cur[x*3+1]; bl = cur[x*3+2]; break;
+                            case 3: { uint8_t idx = cur[x];
+                                      r = pal[idx][0]; g = pal[idx][1]; bl = pal[idx][2]; break; }
+                            case 4: r = g = bl = cur[x*2]; break;
+                            case 6: r = cur[x*4]; g = cur[x*4+1]; bl = cur[x*4+2]; break;
+                            default: r = g = bl = 0;
+                        }
+                        out[x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bl >> 3);
+                    }
+
+                    cb(row, (int)w, out, user);
+
+                    /* Swap cur/prev */
+                    uint8_t *tmp = prev; prev = cur; cur = tmp;
+                    memset(cur, 0, stride);
+                    row++;
+                    sl_pos = 0;
+                }
+            }
+        }
+
+        /* Advance to next IDAT chunk if needed */
+        if (in_remain == 0 && ci < nidat - 1) {
+            ci++;
+            in_ptr = idat[ci].data;
+            in_remain = idat[ci].len;
+        }
+
+        if (st == TINFL_STATUS_DONE) break;
+        if (st < 0) { free(cur); free(prev); free(out); free(dict); return -1; }
+    }
+
+    free(cur); free(prev); free(out); free(dict);
+    return 0;
+}
