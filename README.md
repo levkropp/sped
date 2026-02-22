@@ -8,7 +8,8 @@
 
 - Streaming row-by-row output via callback (no full-image buffer needed)
 - Direct RGB565 output (native format for most embedded LCD displays)
-- Supports all 8-bit color types: grayscale, RGB, RGBA, grayscale+alpha, indexed (palette)
+- Supports all color types: grayscale, RGB, RGBA, grayscale+alpha, indexed (palette)
+- 8-bit and 16-bit channel depth (16-bit truncated to 8-bit for RGB565 output)
 - Palette transparency (tRNS chunk)
 - All five PNG scanline filter types (None, Sub, Up, Average, Paeth)
 - 1/2 and 1/4 downscaling via pixel averaging (decodes at full resolution, averages output)
@@ -16,7 +17,6 @@
 
 ## Limitations
 
-- 8-bit depth only (no 16-bit channels)
 - No interlacing (Adam7)
 - No CRC verification
 - Requires miniz/tinfl for DEFLATE (available in ESP-IDF via `esp_rom`, or from [miniz](https://github.com/richgel999/miniz))
@@ -74,16 +74,16 @@ Or configure the include path:
 
 | Library | Lines | License | Streaming | RGB565 | Scaling | Interlace | 16-bit | Palette | Needs zlib | RAM |
 |---------|------:|---------|:---------:|:------:|:-------:|:---------:|:------:|:-------:|:----------:|----:|
-| **sped** | **~300** | **MIT** | **yes** | **yes** | **1/2/4** | no | no | **yes** | miniz | **~35 KB** |
+| **sped** | **~310** | **MIT** | **yes** | **yes** | **1/2/4** | no | **yes** | **yes** | miniz | **~35 KB** |
 | pngle | ~936 | MIT | yes | no | no | yes | yes | yes | miniz | ~43 KB |
-| PNGdec | ~570 | Apache-2.0 | yes | yes | no | no | yes | yes | bundled | ~48 KB |
+| PNGdec | ~570 | Apache-2.0 | yes | yes | no | no | **yes** | yes | bundled | ~48 KB |
 | uPNG | ~1,362 | BSD | no | no | no | no | no | no | built-in | full image |
 | picoPNG | ~500 | zlib | no | no | no | no | no | limited | built-in | full image |
 | LodePNG | ~9,432 | zlib | no | no | no | yes | yes | yes | built-in | full image |
 | stb_image | ~7,988 | PD/MIT | no | no | no | yes | yes | yes | built-in | full image |
 | libspng | ~7,517 | BSD-2 | yes | no | no | yes | yes | yes | optional | varies |
 
-sped is the smallest PNG decoder with streaming RGB565 output. It trades features (interlacing, 16-bit, CRC checks) for minimal code size and memory usage, making it ideal for resource-constrained microcontrollers where you just need to get an image onto an LCD.
+sped is the smallest PNG decoder with streaming RGB565 output, and strictly dominates PNGdec, picoPNG, and uPNG on every feature that matters for embedded LCD displays. It trades interlacing and CRC checks for minimal code size and memory usage.
 
 ## License
 
