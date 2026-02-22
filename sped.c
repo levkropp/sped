@@ -1,5 +1,5 @@
 /*
- * sped.c — Simplest PNG ESP32 Decoder
+ * sped.c — Smallest PNG ESP32 Decoder
  *
  * Streaming PNG decoder: parses chunks, inflates IDAT data via tinfl,
  * reconstructs scanline filters, converts to RGB565 row-by-row.
@@ -40,19 +40,31 @@ static uint8_t paeth(uint8_t a, uint8_t b, uint8_t c)
     return c;
 }
 
-/* Extract RGB from decoded scanline based on color type */
+/* Extract RGB from decoded scanline based on color type and bit depth.
+ * For 16-bit channels, takes the high byte (lossy but correct for RGB565). */
 static void get_pixel(const uint8_t *cur, uint32_t x, uint8_t ctype,
-                      const uint8_t pal[][3],
+                      int bpc, const uint8_t pal[][3],
                       uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    switch (ctype) {
-        case 0: *r = *g = *b = cur[x]; break;
-        case 2: *r = cur[x*3]; *g = cur[x*3+1]; *b = cur[x*3+2]; break;
-        case 3: { uint8_t idx = cur[x];
-                  *r = pal[idx][0]; *g = pal[idx][1]; *b = pal[idx][2]; break; }
-        case 4: *r = *g = *b = cur[x*2]; break;
-        case 6: *r = cur[x*4]; *g = cur[x*4+1]; *b = cur[x*4+2]; break;
-        default: *r = *g = *b = 0;
+    if (bpc == 1) {
+        switch (ctype) {
+            case 0: *r = *g = *b = cur[x]; break;
+            case 2: *r = cur[x*3]; *g = cur[x*3+1]; *b = cur[x*3+2]; break;
+            case 3: { uint8_t idx = cur[x];
+                      *r = pal[idx][0]; *g = pal[idx][1]; *b = pal[idx][2]; break; }
+            case 4: *r = *g = *b = cur[x*2]; break;
+            case 6: *r = cur[x*4]; *g = cur[x*4+1]; *b = cur[x*4+2]; break;
+            default: *r = *g = *b = 0;
+        }
+    } else {
+        /* 16-bit: take high byte of each channel */
+        switch (ctype) {
+            case 0: *r = *g = *b = cur[x*2]; break;
+            case 2: *r = cur[x*6]; *g = cur[x*6+2]; *b = cur[x*6+4]; break;
+            case 4: *r = *g = *b = cur[x*4]; break;
+            case 6: *r = cur[x*8]; *g = cur[x*8+2]; *b = cur[x*8+4]; break;
+            default: *r = *g = *b = 0;
+        }
     }
 }
 
@@ -95,17 +107,19 @@ int sped_decode(const void *png, size_t len, int scale,
     if (ihdr[10] != 0) return -1;  /* compression must be 0 */
     if (ihdr[11] != 0) return -1;  /* filter must be 0 */
     if (ihdr[12] != 0) return -1;  /* interlace not supported */
-    if (depth != 8) return -1;     /* only 8-bit depth */
+    if (depth != 8 && depth != 16) return -1;
+    if (depth == 16 && ctype == 3) return -1;  /* 16-bit indexed doesn't exist */
     if (w == 0 || h == 0) return -1;
 
-    /* Bytes per pixel */
+    /* Bytes per pixel (16-bit channels = 2 bytes each) */
+    int bpc = depth / 8;  /* bytes per channel: 1 or 2 */
     int bpp;
     switch (ctype) {
-        case 0: bpp = 1; break;  /* grayscale */
-        case 2: bpp = 3; break;  /* RGB */
-        case 3: bpp = 1; break;  /* indexed (palette) */
-        case 4: bpp = 2; break;  /* grayscale + alpha */
-        case 6: bpp = 4; break;  /* RGBA */
+        case 0: bpp = 1 * bpc; break;  /* grayscale */
+        case 2: bpp = 3 * bpc; break;  /* RGB */
+        case 3: bpp = 1;       break;  /* indexed (always 8-bit) */
+        case 4: bpp = 2 * bpc; break;  /* grayscale + alpha */
+        case 6: bpp = 4 * bpc; break;  /* RGBA */
         default: return -1;
     }
     int stride = (int)(w * bpp);
@@ -237,7 +251,7 @@ int sped_decode(const void *png, size_t len, int scale,
                         /* Convert to RGB565 and emit directly */
                         for (uint32_t x = 0; x < w; x++) {
                             uint8_t r, g, bl;
-                            get_pixel(cur, x, ctype, pal, &r, &g, &bl);
+                            get_pixel(cur, x, ctype, bpc, pal, &r, &g, &bl);
                             out[x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bl >> 3);
                         }
                         cb(row, (int)w, out, user);
@@ -246,7 +260,7 @@ int sped_decode(const void *png, size_t len, int scale,
                         uint32_t limit = out_w * (uint32_t)scale;
                         for (uint32_t x = 0; x < limit && x < w; x++) {
                             uint8_t r, g, bl;
-                            get_pixel(cur, x, ctype, pal, &r, &g, &bl);
+                            get_pixel(cur, x, ctype, bpc, pal, &r, &g, &bl);
                             uint32_t ox = x / (uint32_t)scale;
                             acc[ox * 3 + 0] += r;
                             acc[ox * 3 + 1] += g;
