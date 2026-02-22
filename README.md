@@ -1,6 +1,6 @@
 # sped
 
-**Simplest PNG ESP32 Decoder** -- a minimal streaming PNG decoder for embedded systems.
+**~~Simplest~~ Smallest PNG ESP32 Decoder** -- a minimal streaming PNG decoder for embedded systems.
 
 ~300 lines of C. Decodes PNG images to RGB565 row-by-row via callback. Uses tinfl (from miniz) for DEFLATE decompression. Built-in 1/2 and 1/4 downscaling.
 
