@@ -3,6 +3,7 @@
  *
  * Streaming PNG decoder: parses chunks, inflates IDAT data via tinfl,
  * reconstructs scanline filters, converts to RGB565 row-by-row.
+ * Supports 1/2 and 1/4 downscaling via pixel averaging.
  *
  * Requires: miniz.h (tinfl) — available in ESP-IDF via esp_rom,
  * or from https://github.com/richgel999/miniz
@@ -39,6 +40,22 @@ static uint8_t paeth(uint8_t a, uint8_t b, uint8_t c)
     return c;
 }
 
+/* Extract RGB from decoded scanline based on color type */
+static void get_pixel(const uint8_t *cur, uint32_t x, uint8_t ctype,
+                      const uint8_t pal[][3],
+                      uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    switch (ctype) {
+        case 0: *r = *g = *b = cur[x]; break;
+        case 2: *r = cur[x*3]; *g = cur[x*3+1]; *b = cur[x*3+2]; break;
+        case 3: { uint8_t idx = cur[x];
+                  *r = pal[idx][0]; *g = pal[idx][1]; *b = pal[idx][2]; break; }
+        case 4: *r = *g = *b = cur[x*2]; break;
+        case 6: *r = cur[x*4]; *g = cur[x*4+1]; *b = cur[x*4+2]; break;
+        default: *r = *g = *b = 0;
+    }
+}
+
 /* Max IDAT chunks we track */
 #define SPED_MAX_IDAT 64
 
@@ -53,8 +70,11 @@ int sped_info(const void *png, size_t len, sped_info_t *info)
     return 0;
 }
 
-int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user)
+int sped_decode(const void *png, size_t len, int scale,
+                sped_row_cb cb, void *user)
 {
+    if (scale != 1 && scale != 2 && scale != 4) return -1;
+
     const uint8_t *base = png;
     const uint8_t *end = base + len;
 
@@ -89,6 +109,11 @@ int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user)
         default: return -1;
     }
     int stride = (int)(w * bpp);
+
+    /* Output dimensions */
+    uint32_t out_w = w / (uint32_t)scale;
+    uint32_t out_h = h / (uint32_t)scale;
+    if (out_w == 0 || out_h == 0) return -1;
 
     /* Scan chunks: collect PLTE, tRNS, IDAT pointers */
     uint8_t pal[256][3];
@@ -132,10 +157,16 @@ int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user)
     /* Allocate work buffers */
     uint8_t *cur = calloc(1, stride);
     uint8_t *prev = calloc(1, stride);
-    uint16_t *out = malloc(w * sizeof(uint16_t));
+    uint16_t *out = malloc(out_w * sizeof(uint16_t));
     uint8_t *dict = malloc(TINFL_LZ_DICT_SIZE);
-    if (!cur || !prev || !out || !dict) {
-        free(cur); free(prev); free(out); free(dict);
+
+    /* Accumulator for downscaling: sum of R, G, B per output pixel */
+    uint16_t *acc = NULL;
+    if (scale > 1)
+        acc = calloc(out_w * 3, sizeof(uint16_t));
+
+    if (!cur || !prev || !out || !dict || (scale > 1 && !acc)) {
+        free(cur); free(prev); free(out); free(dict); free(acc);
         return -1;
     }
 
@@ -153,6 +184,7 @@ int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user)
     int sl_pos = 0;        /* 0 = expecting filter byte, 1..stride = pixel data */
     uint8_t filter = 0;
     int row = 0;
+    int out_row = 0;
 
     while (row < (int)h) {
         /* Determine flags for tinfl */
@@ -192,31 +224,49 @@ int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user)
                     for (int i = 0; i < stride; i++) {
                         uint8_t a = (i >= bpp) ? cur[i - bpp] : 0;
                         uint8_t b = prev[i];
-                        uint8_t c = (i >= bpp) ? prev[i - bpp] : 0;
+                        uint8_t c_val = (i >= bpp) ? prev[i - bpp] : 0;
                         switch (filter) {
                             case 1: cur[i] += a; break;
                             case 2: cur[i] += b; break;
                             case 3: cur[i] += (uint8_t)((a + b) >> 1); break;
-                            case 4: cur[i] += paeth(a, b, c); break;
+                            case 4: cur[i] += paeth(a, b, c_val); break;
                         }
                     }
 
-                    /* Convert to RGB565 */
-                    for (uint32_t x = 0; x < w; x++) {
-                        uint8_t r, g, bl;
-                        switch (ctype) {
-                            case 0: r = g = bl = cur[x]; break;
-                            case 2: r = cur[x*3]; g = cur[x*3+1]; bl = cur[x*3+2]; break;
-                            case 3: { uint8_t idx = cur[x];
-                                      r = pal[idx][0]; g = pal[idx][1]; bl = pal[idx][2]; break; }
-                            case 4: r = g = bl = cur[x*2]; break;
-                            case 6: r = cur[x*4]; g = cur[x*4+1]; bl = cur[x*4+2]; break;
-                            default: r = g = bl = 0;
+                    if (scale == 1) {
+                        /* Convert to RGB565 and emit directly */
+                        for (uint32_t x = 0; x < w; x++) {
+                            uint8_t r, g, bl;
+                            get_pixel(cur, x, ctype, pal, &r, &g, &bl);
+                            out[x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bl >> 3);
                         }
-                        out[x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bl >> 3);
-                    }
+                        cb(row, (int)w, out, user);
+                    } else {
+                        /* Accumulate R/G/B for downscaling */
+                        uint32_t limit = out_w * (uint32_t)scale;
+                        for (uint32_t x = 0; x < limit && x < w; x++) {
+                            uint8_t r, g, bl;
+                            get_pixel(cur, x, ctype, pal, &r, &g, &bl);
+                            uint32_t ox = x / (uint32_t)scale;
+                            acc[ox * 3 + 0] += r;
+                            acc[ox * 3 + 1] += g;
+                            acc[ox * 3 + 2] += bl;
+                        }
 
-                    cb(row, (int)w, out, user);
+                        /* Emit averaged row every 'scale' input rows */
+                        if ((row % scale) == scale - 1) {
+                            int div = scale * scale;
+                            for (uint32_t ox = 0; ox < out_w; ox++) {
+                                uint8_t r  = (uint8_t)(acc[ox * 3 + 0] / div);
+                                uint8_t g  = (uint8_t)(acc[ox * 3 + 1] / div);
+                                uint8_t bl = (uint8_t)(acc[ox * 3 + 2] / div);
+                                out[ox] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bl >> 3);
+                            }
+                            cb(out_row, (int)out_w, out, user);
+                            out_row++;
+                            memset(acc, 0, out_w * 3 * sizeof(uint16_t));
+                        }
+                    }
 
                     /* Swap cur/prev */
                     uint8_t *tmp = prev; prev = cur; cur = tmp;
@@ -235,9 +285,12 @@ int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user)
         }
 
         if (st == TINFL_STATUS_DONE) break;
-        if (st < 0) { free(cur); free(prev); free(out); free(dict); return -1; }
+        if (st < 0) {
+            free(cur); free(prev); free(out); free(dict); free(acc);
+            return -1;
+        }
     }
 
-    free(cur); free(prev); free(out); free(dict);
+    free(cur); free(prev); free(out); free(dict); free(acc);
     return 0;
 }
