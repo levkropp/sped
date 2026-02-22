@@ -76,14 +76,14 @@ Or configure the include path:
 |---------|------:|---------|:---------:|:------:|:-------:|:---------:|:------:|:-------:|:----------:|----:|
 | **sped** | **~310** | **MIT** | **yes** | **yes** | **1/2/4** | no | **yes** | **yes** | miniz | **~35 KB** |
 | pngle | ~936 | MIT | yes | no | no | yes | yes | yes | miniz | ~43 KB |
-| PNGdec | ~570 | Apache-2.0 | yes | yes | no | no | **yes** | yes | bundled | ~48 KB |
-| uPNG | ~1,362 | BSD | no | no | no | no | no | no | built-in | full image |
-| picoPNG | ~500 | zlib | no | no | no | no | no | limited | built-in | full image |
+| PNGdec | ~1,000 | Apache-2.0 | yes | yes | no | no | no | yes | bundled | ~48 KB |
+| uPNG | ~1,362 | zlib | no | no | no | no | yes | no | built-in | full image |
+| picoPNG | ~500 | zlib | no | no | no | yes | yes | limited | built-in | full image |
 | LodePNG | ~9,432 | zlib | no | no | no | yes | yes | yes | built-in | full image |
 | stb_image | ~7,988 | PD/MIT | no | no | no | yes | yes | yes | built-in | full image |
 | libspng | ~7,517 | BSD-2 | yes | no | no | yes | yes | yes | optional | varies |
 
-sped is the smallest PNG decoder with streaming RGB565 output, and strictly dominates PNGdec, picoPNG, and uPNG on every feature that matters for embedded LCD displays. It trades interlacing and CRC checks for minimal code size and memory usage.
+sped is the smallest PNG decoder with streaming RGB565 output and built-in downscaling. It trades interlacing and CRC checks for minimal code size and memory usage, making it ideal for resource-constrained microcontrollers where you just need to get an image onto an LCD.
 
 ## License
 
