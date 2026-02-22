@@ -3,7 +3,7 @@
  *
  * Minimal streaming PNG decoder for embedded systems.
  * Outputs RGB565 row-by-row via callback. Uses tinfl (from miniz)
- * for DEFLATE decompression.
+ * for DEFLATE decompression. Supports 1/2 and 1/4 downscaling.
  *
  * Supports: 8-bit grayscale, RGB, RGBA, grayscale+alpha, indexed (palette).
  * Does not support: interlacing, 16-bit channels, CRC verification.
@@ -28,7 +28,9 @@ typedef void (*sped_row_cb)(int y, int w, const uint16_t *rgb565, void *user);
 /* Get image dimensions without decoding. Returns 0 on success. */
 int sped_info(const void *png, size_t len, sped_info_t *info);
 
-/* Decode PNG to RGB565. Calls cb for each row. Returns 0 on success. */
-int sped_decode(const void *png, size_t len, sped_row_cb cb, void *user);
+/* Decode PNG to RGB565. Calls cb for each row. Returns 0 on success.
+ * scale: 1 = full, 2 = half, 4 = quarter resolution. */
+int sped_decode(const void *png, size_t len, int scale,
+                sped_row_cb cb, void *user);
 
 #endif /* SPED_H */
